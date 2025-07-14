@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Environment:
+    Description: Environment name
+    Type: String
+  AppName:
+    Description: Name of the app
+    Type: String
+
+Globals:
+  Function:
+    Handler: index.handler
+    Runtime: nodejs22.x
+    MemorySize: 128
+    Timeout: 29
+    Tracing: Active
+    Environment:
+      Variables:
+        SERVICE_NAME: !Sub '${Environment}-${AppName}-example-service'
+        LOG_LEVEL: 'INFO'
+    Tags:
+      billing:environment: !Ref Environment
+
+Resources:
+  GetAllProducts:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-${AppName}-example-service-get-all-products'
+      CodeUri: ./dist/handlers/example/getAll
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /api/products
+            Method: GET
+            PayloadFormatVersion: '1.0'
+            ApiId: !Ref HttpApi
+            Auth:
+              AuthorizationScopes:
+                - !Sub '${Environment}-${AppName}-resource-server/admin'
+                - !Sub '${Environment}-${AppName}-resource-server/user'
+      Environment:
+        Variables:
+          COGNITO_AUTH_CONFIG_SECRET_MANAGER_KEY: !Sub '${Environment}-${AppName}-cognito-secrets'
+          SERVICE_ENDPOINT:
+            Fn::ImportValue: !Sub '${Environment}-${AppName}-service-endpoint'
+          PRODUCTS_TABLE:
+            Fn::ImportValue: !Sub '${Environment}-${AppName}-example-service-products-ddb-table'
+      Policies:
+        - Statement:
+            - Effect: 'Allow'
+              Action:
+                - 'secretsmanager:GetSecretValue'
+              Resource:
+                - Fn::ImportValue: !Sub '${Environment}-${AppName}-cognito-secrets-arn'
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+              Resource:
+                - Fn::ImportValue: !Sub '${Environment}-${AppName}-example-service-products-ddb-arn'
+  UpdateProduct:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-${AppName}-example-service-update-product'
+      CodeUri: ./dist/handlers/example/update
+      Environment:
+        Variables:
+          PRODUCTS_TABLE:
+            Fn::ImportValue: !Sub '${Environment}-${AppName}-example-service-products-ddb-table'
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /api/products/{productId}
+            Method: PUT
+            PayloadFormatVersion: '1.0'
+            ApiId: !Ref HttpApi
+            Auth:
+              AuthorizationScopes:
+                - !Sub '${Environment}-${AppName}-resource-server/admin'
+                - !Sub '${Environment}-${AppName}-resource-server/user'
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource:
+                - Fn::ImportValue: !Sub '${Environment}-${AppName}-example-service-products-ddb-arn'
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    DependsOn:
+      - GetAllProducts
+      - UpdateProduct
+    Properties:
+      Name: !Sub '${Environment}-${AppName}-example-api-gw'
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowHeaders:
+          - '*'
+        AllowMethods:
+          - '*'
+        AllowOrigins:
+          - '*'
+        ExposeHeaders:
+          - '*'
+      Auth:
+        DefaultAuthorizer: UserAuthorizer
+        Authorizers:
+          UserAuthorizer:
+            JwtConfiguration:
+              issuer: !Sub
+                - 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
+                - UserPoolId:
+                    Fn::ImportValue: !Sub '${Environment}-${AppName}-user-pool-id'
+              audience:
+                - Fn::ImportValue: !Sub '${Environment}-${AppName}-user-pool-client-id'
+                - Fn::ImportValue: !Sub '${Environment}-${AppName}-user-pool-m2m-client-id'
+            IdentitySource: '$request.header.Authorization'
+      AccessLogSettings:
+        DestinationArn: !GetAtt AccessLogs.Arn
+        Format: '{"integrationError": $context.integration.error, "error": "$context.error.message", "authorizerError": "$context.authorizer.error", "requestId": "$context.requestId", "path": "$context.path", "routeKey": "$context.routeKey", "ip": "$context.identity.sourceIp", "requestTime": "$context.requestTime", "httpMethod": "$context.httpMethod", "statusCode": $context.status }'
+      Tags:
+        billing:environment: !Ref Environment
+
+  AccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${Environment}-${AppName}-example-api-gateway'
+      RetentionInDays: 14
+      Tags:
+        - Key: billing:environment
+          Value: !Ref Environment
+
+Outputs:
+  HttpApiUrl:
+    Description: URL of your example service API endpoint
+    Value:
+      Fn::Sub: 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${Environment}/'
+    Export:
+      Name: !Sub '${Environment}-${AppName}-example-api-gw-endpoint'
+
+  HttpApiId:
+    Description: Api id of example service HttpApi
+    Value:
+      Ref: HttpApi
+    Export:
+      Name: !Sub '${Environment}-${AppName}-example-api-gw-id'
