@@ -1,0 +1,382 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Create authentications using cognito"
+
+Parameters:
+  Environment:
+    Description: "Environment"
+    Type: String
+    Default: dev
+  AppName:
+    Description: "Name of your application"
+    Type: String
+  DomainName:
+    Description: "Domain Name"
+    Type: String
+    Default: abc.example.com
+
+Resources:
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${Environment}-${AppName}-user-pool"
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: Welcome to {CompanyName}!
+          EmailMessage: |
+            <!DOCTYPE html>
+              <html lang="en">
+              <head>
+                  <meta charset="UTF-8">
+                  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                  <title>Your Account Is Ready</title>
+                  <style>
+                      body {
+                          font-family: Arial, sans-serif;
+                          background-color: #f4f4f4;
+                          margin: 0;
+                          padding: 20px;
+                      }
+                      .container {
+                          max-width: 600px;
+                          margin: 0 auto;
+                          background-color: #ffffff;
+                          padding: 20px;
+                          border-radius: 5px;
+                          box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+                      }
+                      h1 {
+                          color: #333;
+                          font-size: 24px;
+                          margin-bottom: 10px;
+                      }
+                      p {
+                          color: #555;
+                          line-height: 1.6;
+                      }
+                      .important {
+                          font-weight: bold;
+                          color: #000;
+                      }
+                  </style>
+              </head>
+              <body>
+                  <div class="container">
+                      <h1>Your Account Is Ready</h1>
+                      <p>You've been invited to join {CompanyName}. Your account has been created successfully. Please use the following details to sign in:</p>
+                      <ul>
+                          <li><strong>Username</strong>: <span class="important">{username}</span></li>
+                          <li><strong>Temporary Password</strong>: <span class="important">{####}</span></li>
+                      </ul>
+                      <p>If you have any questions, feel free to reach out to support.</p>
+                      <p>Best regards,<br>The {CompanyName} Team.</p>
+                  </div>
+              </body>
+              </html>
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: "verified_email"
+            Priority: 1
+      AutoVerifiedAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      DeletionProtection: ACTIVE
+      EmailConfiguration:
+        EmailSendingAccount: DEVELOPER
+        SourceArn: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}"
+        From: !Sub "noreply@${DomainName}"
+      MfaConfiguration: "OFF"
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      LambdaConfig:
+        PreTokenGenerationConfig:
+          LambdaArn: !GetAtt PreTokenGenerationTrigger.Arn
+          LambdaVersion: V2_0
+      UserPoolAddOns:
+        AdvancedSecurityMode: AUDIT
+      UserPoolTags:
+        "billing:environment": !Ref Environment
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn:
+      - CognitoResourceServer
+    Properties:
+      ClientName: !Sub "${Environment}-${AppName}-user-pool-client"
+      UserPoolId: !Ref CognitoUserPool
+      TokenValidityUnits:
+        AccessToken: days
+        IdToken: days
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      PreventUserExistenceErrors: ENABLED
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - !Sub "${Environment}-${AppName}-resource-server/admin"
+        - !Sub "${Environment}-${AppName}-resource-server/user"
+      CallbackURLs:
+        - "http://localhost:5173"
+        - "http://localhost:5173/callback"
+        - Fn::ImportValue: !Sub "${Environment}-${AppName}-service-endpoint"
+        - !Join
+          - ""
+          - - Fn::ImportValue: !Sub "${Environment}-${AppName}-service-endpoint"
+            - "/callback"
+      LogoutURLs:
+        - "http://localhost:5173"
+        - Fn::ImportValue: !Sub "${Environment}-${AppName}-service-endpoint"
+
+  # Permission for Cognito to invoke the lambda function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PreTokenGenerationTrigger.Arn
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt CognitoUserPool.Arn
+
+  # Role for the pre token generation lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Pre token generation lambda function
+  PreTokenGenerationTrigger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-${AppName}-pre-token-generation-trigger"
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs20.x
+      Environment:
+        Variables:
+          ENV_STATE: !Ref State
+          ENV_ENVIRONMENT: !Ref Environment
+          ENV_COUNCIL: !Ref Council
+      Tags:
+        - Key: billing:environment
+          Value: !Ref Environment
+      Code:
+        ZipFile: |
+          const handler = function(event, context) {
+            // Get environment variables passed from parameters
+            const state = process.env.ENV_STATE || '';
+            const environment = process.env.ENV_ENVIRONMENT || '';
+            const council = process.env.ENV_COUNCIL || '';
+
+            // Get user groups from the event object
+            const userGroups = event.request.groupConfiguration.groupsToOverride || [];
+
+            // Set user attributes
+            const email = event.request?.userAttributes?.email;
+            const name = event.request?.userAttributes?.name;
+
+            // Default scopes
+            const scopesToAdd = [];
+            const scopesToSuppress = ["aws.cognito.signin.user.admin"];
+
+            // Add scopes based on user groups
+            if (userGroups.includes(`${Environment}-${AppName}-user-pool-group-admin`)) {
+                // Add admin-specific scope using environment variables
+                scopesToAdd.push(`${Environment}-${AppName}-resource-server/admin`);
+            }
+            if (userGroups.includes(`${Environment}-${AppName}-user-pool-group-m2m`)) {
+                // Add m2m-specific scope using environment variables
+                scopesToAdd.push(`${Environment}-${AppName}-resource-server/m2m`);
+            }
+            if (userGroups.includes(`${Environment}-${AppName}-user-pool-group-user`)) {
+                // Add user-specific scope using environment variables
+                scopesToAdd.push(`${Environment}-${AppName}-resource-server/user`);
+            }
+
+            // Set the claims and scope overrides
+            event.response = {
+                "claimsAndScopeOverrideDetails": {
+                    "accessTokenGeneration": {
+                        "claimsToAddOrOverride": {
+                            "email": email,
+                            "name": name
+                        },
+                        "scopesToAdd": scopesToAdd,
+                        "scopesToSuppress": scopesToSuppress
+                    }
+                }
+            };
+
+            // Return to Amazon Cognito
+            context.done(null, event);
+          };
+          module.exports = { handler };
+
+  CognitoUserPoolClientM2M:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn:
+      - CognitoResourceServer
+    Properties:
+      ClientName: !Sub "${Environment}-${AppName}-user-pool-client-m2m"
+      UserPoolId: !Ref CognitoUserPool
+      TokenValidityUnits:
+        AccessToken: days
+        IdToken: days
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - !Sub "${Environment}-${AppName}-resource-server/m2m"
+
+  CognitoResourceServer:
+    Type: "AWS::Cognito::UserPoolResourceServer"
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Identifier: !Sub "${Environment}-${AppName}-resource-server"
+      Name: !Sub "${Environment}-${AppName}-cognito-resource-server"
+      Scopes:
+        - ScopeName: "admin"
+          ScopeDescription: "Admin-level access to the APIs"
+        - ScopeName: "user"
+          ScopeDescription: "User-level access to the APIs"
+        - ScopeName: "m2m"
+          ScopeDescription: "Service-level access to the APIs"
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${Environment}-${AppName}-user"
+      UserPoolId: !Ref CognitoUserPool
+
+  UserPoolGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: User pool group for standard users
+      GroupName: !Sub "${Environment}-${AppName}-user-pool-group-user"
+      Precedence: 0
+      UserPoolId: !Ref CognitoUserPool
+
+  UserPoolAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: User pool group for admin users
+      GroupName: !Sub "${Environment}-${AppName}-user-pool-group-admin"
+      Precedence: 1
+      UserPoolId: !Ref CognitoUserPool
+
+  UserPoolM2MGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: User pool group for machine to machine communication
+      GroupName: !Sub "${Environment}-${AppName}-user-pool-group-m2m"
+      Precedence: 2
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoSecrets:
+    Type: AWS::SecretsManager::Secret
+    DependsOn:
+      - CognitoUserPool
+      - CognitoUserPoolClient
+      - CognitoUserPoolClientM2M
+    Properties:
+      Name: !Sub "${Environment}-${AppName}-cognito-secrets"
+      SecretString: !Join
+        - ""
+        - - "{"
+          - '"clientId": "'
+          - !Ref CognitoUserPoolClient
+          - '", '
+          - '"m2mClientId": "'
+          - !Ref CognitoUserPoolClientM2M
+          - '", '
+          - '"m2mClientSecret": "'
+          - !GetAtt CognitoUserPoolClientM2M.ClientSecret
+          - '"}'
+      Tags:
+        - Key: billing:environment
+          Value: !Ref Environment
+
+Outputs:
+  CognitoUserPool:
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub "${Environment}-${AppName}-user-pool-id"
+
+  CognitoUserPoolArn:
+    Value: !GetAtt CognitoUserPool.Arn
+    Export:
+      Name: !Sub "${Environment}-${AppName}-user-pool-arn"
+
+  CognitoUserPoolClient:
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub "${Environment}-${AppName}-user-pool-client-id"
+
+  CognitoUserPoolClientM2M:
+    Value: !Ref CognitoUserPoolClientM2M
+    Export:
+      Name: !Sub "${Environment}-${AppName}-user-pool-m2m-client-id"
+
+  CognitoUserPoolGroup:
+    Value: !Ref UserPoolGroup
+    Export:
+      Name: !Sub "${Environment}-${AppName}-pool-user-group-id"
+
+  CognitoAdminPoolGroup:
+    Value: !Ref UserPoolAdminGroup
+    Export:
+      Name: !Sub "${Environment}-${AppName}-pool-admin-group-id"
+
+  CognitoM2MPoolGroup:
+    Value: !Ref UserPoolM2MGroup
+    Export:
+      Name: !Sub "${Environment}-${AppName}-pool-m2m-group-id"
+
+  CognitoUserPoolDomainName:
+    Value: !Join
+      - ""
+      - - !Ref UserPoolDomain
+        - !Sub ".auth.${AWS::Region}.amazoncognito.com"
+    Export:
+      Name: !Sub "${Environment}-${AppName}-user-pool-domain"
+
+  CognitoSecretsArn:
+    Description: Cognito Secrets Arn
+    Value: !Ref CognitoSecrets
+    Export:
+      Name: !Sub "${Environment}-${AppName}-cognito-secrets-arn"
